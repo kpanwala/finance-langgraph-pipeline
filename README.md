@@ -1,226 +1,141 @@
-# Financial Exploration LangGraph
+# Indian Equity Intelligence Agent (LangGraph & Groq)
 
-This is a reference design for turning the tools in `demo.ipynb` into a financial exploration workflow for Indian listed companies.
+A stateful, multi-turn financial research assistant built with **LangGraph**, **LangChain**, and **ChatGroq**. The agent retrieves company fundamentals for Indian equities (NSE/BSE), scrapes recent financial news from trusted domain sources, looks up business backgrounds on Wikipedia, and manages conversation context through automated state summarization.
 
-The workflow should:
+---
 
-1. Accept a user question such as `Compare Infosys revenue and debt with recent news`.
-2. Identify the company, exchange, and requested analysis.
-3. Collect structured financial facts with `get_company_financials`.
-4. Collect recent financial news with `get_company_news`.
-5. Synthesize a concise answer with clear source boundaries and caveats.
-6. Ask for clarification or run another exploration when required information is missing.
-
-## Flow graph
+## Architecture Overview
 
 ```mermaid
 flowchart TD
-    START --> planner
-    planner -->|needs clarification| clarification
-    planner -->|ready| financials
-    planner -->|ready| news
-    financials --> synthesis
-    news --> synthesis
-    synthesis -->|missing or ambiguous facts| clarification
-    synthesis -->|answer complete| END
-    clarification -->|user supplies details| planner
+    START([Start]) --> tool_calling_llm[tool_calling_llm\n(ChatGroq / GPT-OSS)]
+    
+    tool_calling_llm -->|Tool Call Requested| tools[tools\n(ToolNode)]
+    tool_calling_llm -->|Direct Reply & Messages > 2| summarize_conversation[summarize_conversation]
+    tool_calling_llm -->|Direct Reply & Messages <= 2| END1([End])
+    
+    tools --> summarize_tool_result[summarize_tool_result\nGrounded Synthesis]
+    
+    summarize_tool_result -->|Messages > 2| summarize_conversation
+    summarize_tool_result -->|Messages <= 2| END2([End])
+    
+    summarize_conversation --> END3([End])
 ```
 
-`financials` and `news` are independent after planning, so they can be modeled as parallel branches. If the first version uses a normal sequential graph, keep the same node boundaries and add parallel execution later.
+The system employs a cyclical graph pattern:
+1. **Dynamic Tool Calling**: Determines whether user intent requires financial data, news lookup, or background knowledge.
+2. **Strict Synthesis Node (`summarize_tool_result`)**: Enforces non-hallucinatory summaries strictly adhering to tool responses.
+3. **Context Trimming & Summarization (`summarize_conversation`)**: When message history exceeds a specified cutoff (e.g., > 2 messages), older messages are condensed into a persistent running summary and replaced with `RemoveMessage` to conserve LLM token windows while retaining user memory across multi-turn sessions.
 
-## State design
+---
 
-Use a typed state so every node has a predictable contract:
+## Features & Integrated Tools
 
-```python
-from typing import Annotated, TypedDict
-from langgraph.graph.message import add_messages
+| Tool | Source / Package | Purpose | Scope / Configuration |
+| :--- | :--- | :--- | :--- |
+| `get_company_financials` | `yfinance` | Fundamental statement metrics | Extracts revenue, latest net income, historical profit, operating cashflow, and total debt for NSE (`.NS`) and BSE (`.BO`) tickers. |
+| `get_company_news` | `langchain_tavily` | Recent financial developments | Focused search query restricted to trusted publications: `moneycontrol.com`, `economictimes.indiatimes.com`, `livemint.com`. |
+| `wikipedia` | `langchain_community` | Company overview & executive background | Brief overviews (top 1 result, max 500 chars) for founding history, founders, and corporate profile. |
 
+---
 
-class FinancialState(TypedDict, total=False):
-    messages: Annotated[list, add_messages]
-    user_question: str
-    company_name: str
-    symbol: str
-    exchange: str
-    financials: str
-    news: str
-    answer: str
-    needs_clarification: bool
-    clarification_question: str
+## Project Structure
+
+```text
+.
+├── demo.ipynb          # Interactive notebook with tools, state graph, and multi-turn runs
+├── requirements.txt    # Python dependencies
+├── .env.example        # Environment variables template
+└── README.md           # Documentation
 ```
 
-Keep raw tool responses in `financials` and `news`. Do not overwrite them with the model's interpretation; this makes the final answer auditable and allows a later node to re-summarize the same evidence.
+---
 
-## Node responsibilities
+## Getting Started
 
-### 1. `planner`
+### 1. Prerequisites
+- Python 3.10+
+- A [Groq API Key](https://console.groq.com/)
+- A [Tavily API Key](https://tavily.com/)
 
-- Read the latest user message.
-- Extract `company_name`, ticker `symbol`, and `exchange`.
-- Default the exchange to `NS` only when the company identifier is unambiguous.
-- Set `needs_clarification=True` when the company or exchange cannot be determined safely.
-- Do not call external tools from this node.
+### 2. Installation
 
-For Indian Yahoo Finance tickers, the existing tool expects symbols such as `INFY.NS` or `INFY.BO`; the tool itself builds this value from `symbol` and `exchange`.
+Clone the repository and install the dependencies:
 
-### 2. `financials`
-
-Call the existing `get_company_financials` tool:
-
-```python
-financials = get_company_financials.invoke({
-    "symbol": state["symbol"],
-    "exchange": state.get("exchange", "NS"),
-})
-return {"financials": financials}
+```bash
+git clone https://github.com/your-username/equity-intelligence-agent.git
+cd equity-intelligence-agent
+pip install -r requirements.txt
 ```
 
-The current tool returns latest revenue, net income, operating cash flow, and total debt when those rows are available.
+### 3. Environment Setup
 
-### 3. `news`
+Create a `.env` file in the root directory:
 
-Call the existing `get_company_news` tool:
-
-```python
-news = get_company_news.invoke({
-    "company_name": state["company_name"],
-})
-return {"news": news}
+```bash
+cp .env.example .env
 ```
 
-This requires `TAVILY_API_KEY` and searches the configured finance domains.
+Add your API credentials:
 
-### 4. `synthesis`
+```env
+GROQ_API_KEY="gsk_..."
+TAVILY_API_KEY="tvly-..."
+```
 
-Use the model to produce the final response from the question and the two collected results. The synthesis prompt should require:
+---
 
-- a direct answer first;
-- separate sections for financial metrics and news;
-- explicit `not available` wording for missing fields;
-- no investment recommendation or certainty beyond the evidence;
-- a note that the data is informational and may be delayed;
-- clarification when the tool response is empty or malformed.
+## Usage
 
-### 5. `clarification`
+You can open and execute `demo.ipynb` in Jupyter Notebook, VS Code, or Google Colab.
 
-Return a human-readable question, for example:
-
-> Which company and exchange should I use? Please provide a ticker such as `INFY` with `NS` or `BO`.
-
-For a chat application, stop the graph at this node and merge the user's next message back into `messages` before routing to `planner` again.
-
-## Reference implementation skeleton
-
-The following is a minimal graph shape. Add it after the tool definitions in `demo.ipynb`, or move the tool definitions and this graph into a `.py` module when the workflow stabilizes.
+### Minimal Invocation Example
 
 ```python
-from typing import Literal
-from langgraph.graph import END, START, StateGraph
+from langchain_core.messages import HumanMessage
+from demo import graph  # or compile the graph from the notebook
 
+# Specify a persistent thread for state checkpoints
+config = {"configurable": {"thread_id": "portfolio_research_01"}}
 
-def planner(state: FinancialState) -> FinancialState:
-    # Replace this with a structured-output model in the real application.
-    question = state["user_question"]
-    return {
-        "company_name": "Infosys",
-        "symbol": "INFY",
-        "exchange": "NS",
-        "needs_clarification": False,
-    }
-
-
-def collect_financials(state: FinancialState) -> FinancialState:
-    result = get_company_financials.invoke({
-        "symbol": state["symbol"],
-        "exchange": state.get("exchange", "NS"),
-    })
-    return {"financials": result}
-
-
-def collect_news(state: FinancialState) -> FinancialState:
-    result = get_company_news.invoke({
-        "company_name": state["company_name"],
-    })
-    return {"news": result}
-
-
-def synthesize(state: FinancialState) -> FinancialState:
-    # Invoke a chat model here with state["user_question"],
-    # state["financials"], and state["news"].
-    answer = (
-        f"Financials for {state['company_name']}:\n{state.get('financials', '')}\n\n"
-        f"Recent news:\n{state.get('news', '')}"
-    )
-    return {"answer": answer}
-
-
-def ask_clarification(state: FinancialState) -> FinancialState:
-    return {
-        "clarification_question": (
-            "Which company and exchange should I use? "
-            "Provide a ticker such as INFY with NS or BO."
-        )
-    }
-
-
-def route_after_planning(
-    state: FinancialState,
-) -> Literal["clarification", "financials"]:
-    if state.get("needs_clarification"):
-        return "clarification"
-    return "financials"
-
-
-builder = StateGraph(FinancialState)
-builder.add_node("planner", planner)
-builder.add_node("financials", collect_financials)
-builder.add_node("news", collect_news)
-builder.add_node("synthesis", synthesize)
-builder.add_node("clarification", ask_clarification)
-
-builder.add_edge(START, "planner")
-builder.add_conditional_edges(
-    "planner",
-    route_after_planning,
-    {"clarification": "clarification", "financials": "financials"},
+# Turn 1: Ask an overview question
+res1 = graph.invoke(
+    {"messages": [HumanMessage(content="What does Infosys do in under 100 words?")]},
+    config=config
 )
-builder.add_edge("financials", "news")
-builder.add_edge("news", "synthesis")
-builder.add_edge("synthesis", END)
-builder.add_edge("clarification", END)
+print(res1["messages"][-1].content)
 
-graph = builder.compile()
+# Turn 2: Query financials (triggers automatic memory compaction)
+res2 = graph.invoke(
+    {"messages": [HumanMessage(content="What was their profit growth over the last 3 years?")]},
+    config=config
+)
+print(res2["messages"][-1].content)
 
-result = graph.invoke({
-    "user_question": "Summarize Infosys financials and recent news",
-})
-print(result["answer"])
+# Turn 3: Context recall from previous turns
+res3 = graph.invoke(
+    {"messages": [HumanMessage(content="Which company was I asking about?")]},
+    config=config
+)
+print(res3["messages"][-1].content)
 ```
 
-## Recommended model-powered planner
+---
 
-The hard-coded planner above only demonstrates graph wiring. For the real workflow, define a structured schema and ask the chat model to extract it:
+## Dependencies
 
-```python
-from pydantic import BaseModel, Field
+- `langgraph`
+- `langchain`
+- `langchain-core`
+- `langchain-groq`
+- `langchain-tavily`
+- `langchain-community`
+- `yfinance`
+- `wikipedia`
+- `python-dotenv`
 
+---
 
-class ExplorationRequest(BaseModel):
-    company_name: str | None = None
-    symbol: str | None = None
-    exchange: str = Field(default="NS", pattern="^(NS|BO)$")
-    needs_clarification: bool
-```
+## Disclaimer
 
-Use `model.with_structured_output(ExplorationRequest)` in `planner`, then copy the validated fields into `FinancialState`. This avoids relying on string parsing for ticker and exchange selection.
-
-## Production checklist
-
-- Load `.env` before invoking the graph; provide `TAVILY_API_KEY` for news search.
-- Catch `yfinance` and Tavily failures inside tool-facing nodes and store a useful error in state.
-- Validate that `symbol` contains the expected ticker format before making a request.
-- Preserve the source text and retrieval date in the state when adding richer tools.
-- Add a `checkpointer` and `thread_id` when clarification requires multi-turn memory.
-- Never present the workflow as personalized investment advice.
-- Test both successful and empty-data paths, including invalid exchanges and failed news search.
+This software is for educational and informational purposes only. Retrieved financial figures, news extracts, and agent outputs do not constitute financial advice or investment recommendations.
